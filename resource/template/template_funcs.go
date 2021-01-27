@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"path"
@@ -49,6 +50,7 @@ func newFuncMap() map[string]interface{} {
 	m["div"] = func(a, b int) int { return a / b }
 	m["mod"] = func(a, b int) int { return a % b }
 	m["mul"] = func(a, b int) int { return a * b }
+	m["rand_int"] = RandInt
 	m["seq"] = Seq
 	m["atoi"] = strconv.Atoi
 	return m
@@ -68,6 +70,12 @@ func Seq(first, last int) []int {
 		arr = append(arr, i)
 	}
 	return arr
+}
+
+// RandInt returns a random integer between min and max
+func RandInt(min, max int) int {
+	rand.Seed(time.Now().UnixNano())
+	return rand.Intn(max-min+1) + min
 }
 
 type byLengthKV []memkv.KVPair
