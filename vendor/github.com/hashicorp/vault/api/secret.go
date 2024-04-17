@@ -1,13 +1,19 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/errwrap"
-	"github.com/hashicorp/vault/helper/jsonutil"
-	"github.com/hashicorp/vault/helper/parseutil"
+	"github.com/hashicorp/go-secure-stdlib/parseutil"
 )
 
 // Secret is the structure returned for every secret within Vault.
@@ -92,16 +98,12 @@ func (s *Secret) TokenRemainingUses() (int, error) {
 		return -1, nil
 	}
 
-	uses, err := parseutil.ParseInt(s.Data["num_uses"])
-	if err != nil {
-		return 0, err
-	}
-
-	return int(uses), nil
+	return parseutil.SafeParseInt(s.Data["num_uses"])
 }
 
 // TokenPolicies returns the standardized list of policies for the given secret.
-// If the secret is nil or does not contain any policies, this returns nil.
+// If the secret is nil or does not contain any policies, this returns nil. It
+// also populates the secret's Auth info with identity/token policy info.
 func (s *Secret) TokenPolicies() ([]string, error) {
 	if s == nil {
 		return nil, nil
@@ -115,24 +117,74 @@ func (s *Secret) TokenPolicies() ([]string, error) {
 		return nil, nil
 	}
 
-	sList, ok := s.Data["policies"].([]string)
-	if ok {
-		return sList, nil
-	}
+	var tokenPolicies []string
 
-	list, ok := s.Data["policies"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unable to convert token policies to expected format")
-	}
-
-	policies := make([]string, len(list))
-	for i := range list {
-		p, ok := list[i].(string)
+	// Token policies
+	{
+		_, ok := s.Data["policies"]
 		if !ok {
-			return nil, fmt.Errorf("unable to convert policy %v to string", list[i])
+			goto TOKEN_DONE
 		}
-		policies[i] = p
+
+		sList, ok := s.Data["policies"].([]string)
+		if ok {
+			tokenPolicies = sList
+			goto TOKEN_DONE
+		}
+
+		list, ok := s.Data["policies"].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("unable to convert token policies to expected format")
+		}
+		for _, v := range list {
+			p, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("unable to convert policy %v to string", v)
+			}
+			tokenPolicies = append(tokenPolicies, p)
+		}
 	}
+
+TOKEN_DONE:
+	var identityPolicies []string
+
+	// Identity policies
+	{
+		v, ok := s.Data["identity_policies"]
+		if !ok || v == nil {
+			goto DONE
+		}
+
+		sList, ok := s.Data["identity_policies"].([]string)
+		if ok {
+			identityPolicies = sList
+			goto DONE
+		}
+
+		list, ok := s.Data["identity_policies"].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("unable to convert identity policies to expected format")
+		}
+		for _, v := range list {
+			p, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("unable to convert policy %v to string", v)
+			}
+			identityPolicies = append(identityPolicies, p)
+		}
+	}
+
+DONE:
+
+	if s.Auth == nil {
+		s.Auth = &SecretAuth{}
+	}
+
+	policies := append(tokenPolicies, identityPolicies...)
+
+	s.Auth.TokenPolicies = tokenPolicies
+	s.Auth.IdentityPolicies = identityPolicies
+	s.Auth.Policies = policies
 
 	return policies, nil
 }
@@ -232,23 +284,101 @@ type SecretWrapInfo struct {
 	WrappedAccessor string    `json:"wrapped_accessor"`
 }
 
+type MFAMethodID struct {
+	Type         string `json:"type,omitempty"`
+	ID           string `json:"id,omitempty"`
+	UsesPasscode bool   `json:"uses_passcode,omitempty"`
+	Name         string `json:"name,omitempty"`
+}
+
+type MFAConstraintAny struct {
+	Any []*MFAMethodID `json:"any,omitempty"`
+}
+
+type MFARequirement struct {
+	MFARequestID   string                       `json:"mfa_request_id,omitempty"`
+	MFAConstraints map[string]*MFAConstraintAny `json:"mfa_constraints,omitempty"`
+}
+
 // SecretAuth is the structure containing auth information if we have it.
 type SecretAuth struct {
-	ClientToken string            `json:"client_token"`
-	Accessor    string            `json:"accessor"`
-	Policies    []string          `json:"policies"`
-	Metadata    map[string]string `json:"metadata"`
+	ClientToken      string            `json:"client_token"`
+	Accessor         string            `json:"accessor"`
+	Policies         []string          `json:"policies"`
+	TokenPolicies    []string          `json:"token_policies"`
+	IdentityPolicies []string          `json:"identity_policies"`
+	Metadata         map[string]string `json:"metadata"`
+	Orphan           bool              `json:"orphan"`
+	EntityID         string            `json:"entity_id"`
 
 	LeaseDuration int  `json:"lease_duration"`
 	Renewable     bool `json:"renewable"`
+
+	MFARequirement *MFARequirement `json:"mfa_requirement"`
 }
 
 // ParseSecret is used to parse a secret value from JSON from an io.Reader.
 func ParseSecret(r io.Reader) (*Secret, error) {
+	// First read the data into a buffer. Not super efficient but we want to
+	// know if we actually have a body or not.
+	var buf bytes.Buffer
+
+	// io.Reader is treated like a stream and cannot be read
+	// multiple times. Duplicating this stream using TeeReader
+	// to use this data in case there is no top-level data from
+	// api response
+	var teebuf bytes.Buffer
+	tee := io.TeeReader(r, &teebuf)
+
+	_, err := buf.ReadFrom(tee)
+	if err != nil {
+		return nil, err
+	}
+	if buf.Len() == 0 {
+		return nil, nil
+	}
+
 	// First decode the JSON into a map[string]interface{}
 	var secret Secret
-	if err := jsonutil.DecodeJSONFromReader(r, &secret); err != nil {
+	dec := json.NewDecoder(&buf)
+	dec.UseNumber()
+	if err := dec.Decode(&secret); err != nil {
 		return nil, err
+	}
+
+	// If the secret is null, add raw data to secret data if present
+	if reflect.DeepEqual(secret, Secret{}) {
+		data := make(map[string]interface{})
+		dec := json.NewDecoder(&teebuf)
+		dec.UseNumber()
+		if err := dec.Decode(&data); err != nil {
+			return nil, err
+		}
+		errRaw, errPresent := data["errors"]
+
+		// if only errors are present in the resp.Body return nil
+		// to return value not found as it does not have any raw data
+		if len(data) == 1 && errPresent {
+			return nil, nil
+		}
+
+		// if errors are present along with raw data return the error
+		if errPresent {
+			var errStrArray []string
+			errBytes, err := json.Marshal(errRaw)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(errBytes, &errStrArray); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf(strings.Join(errStrArray, " "))
+		}
+
+		// if any raw data is present in resp.Body, add it to secret
+		if len(data) > 0 {
+			secret.Data = data
+		}
 	}
 
 	return &secret, nil
