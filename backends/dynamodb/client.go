@@ -1,18 +1,20 @@
 package dynamodb
 
 import (
+	"context"
 	"os"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/kelseyhightower/confd/log"
 )
 
 // Client is a wrapper around the DynamoDB client
 // and also holds the table to lookup key value pairs from
 type Client struct {
-	client *dynamodb.DynamoDB
+	client *dynamodb.Client
 	table  string
 }
 
@@ -20,29 +22,28 @@ type Client struct {
 // configured via the AWS_REGION environment variable.
 // It returns an error if the connection cannot be made or the table does not exist.
 func NewDynamoDBClient(table string) (*Client, error) {
-	var c *aws.Config
+	var cfg aws.Config
+	var err error
+
 	if os.Getenv("DYNAMODB_LOCAL") != "" {
 		log.Debug("DYNAMODB_LOCAL is set")
-		endpoint := "http://localhost:8000"
-		c = &aws.Config{
-			Endpoint: &endpoint,
-		}
+		cfg, err = config.LoadDefaultConfig(context.TODO(),
+			config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(
+				func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+					return aws.Endpoint{URL: "http://localhost:8000"}, nil
+				})))
 	} else {
-		c = nil
+		cfg, err = config.LoadDefaultConfig(context.TODO())
 	}
 
-	session := session.New(c)
-
-	// Fail early, if no credentials can be found
-	_, err := session.Config.Credentials.Get()
 	if err != nil {
 		return nil, err
 	}
 
-	d := dynamodb.New(session)
+	d := dynamodb.NewFromConfig(cfg)
 
 	// Check if the table exists
-	_, err = d.DescribeTable(&dynamodb.DescribeTableInput{TableName: &table})
+	_, err = d.DescribeTable(context.TODO(), &dynamodb.DescribeTableInput{TableName: &table})
 	if err != nil {
 		return nil, err
 	}
@@ -54,17 +55,17 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 	vars := make(map[string]string)
 	for _, key := range keys {
 		// Check if we can find the single item
-		m := make(map[string]*dynamodb.AttributeValue)
-		m["key"] = &dynamodb.AttributeValue{S: aws.String(key)}
-		g, err := c.client.GetItem(&dynamodb.GetItemInput{Key: m, TableName: &c.table})
+		m := make(map[string]types.AttributeValue)
+		m["key"] = &types.AttributeValueMemberS{Value: key}
+		g, err := c.client.GetItem(context.TODO(), &dynamodb.GetItemInput{Key: m, TableName: &c.table})
 		if err != nil {
 			return vars, err
 		}
 
 		if g.Item != nil {
 			if val, ok := g.Item["value"]; ok {
-				if val.S != nil {
-					vars[key] = *val.S
+				if s, ok := val.(*types.AttributeValueMemberS); ok {
+					vars[key] = s.Value
 				} else {
 					log.Warning("Skipping key '%s'. 'value' is not of type 'string'.", key)
 				}
@@ -73,16 +74,18 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 		}
 
 		// Check for nested keys
-		q, err := c.client.Scan(
+		q, err := c.client.Scan(context.TODO(),
 			&dynamodb.ScanInput{
-				ScanFilter: map[string]*dynamodb.Condition{
-					"key": &dynamodb.Condition{
-						AttributeValueList: []*dynamodb.AttributeValue{
-							&dynamodb.AttributeValue{S: aws.String(key)}},
-						ComparisonOperator: aws.String("BEGINS_WITH")}},
-				AttributesToGet: []*string{aws.String("key"), aws.String("value")},
-				TableName:       aws.String(c.table),
-				Select:          aws.String("SPECIFIC_ATTRIBUTES"),
+				FilterExpression: aws.String("begins_with(#k, :key)"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":key": &types.AttributeValueMemberS{Value: key},
+				},
+				ProjectionExpression: aws.String("#k, #v"),
+				ExpressionAttributeNames: map[string]string{
+					"#k": "key",
+					"#v": "value",
+				},
+				TableName: aws.String(c.table),
 			})
 
 		if err != nil {
@@ -92,10 +95,18 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 		for _, i := range q.Items {
 			item := i
 			if val, ok := item["value"]; ok {
-				if val.S != nil {
-					vars[*item["key"].S] = *val.S
+				if s, ok := val.(*types.AttributeValueMemberS); ok {
+					if keyVal, ok := item["key"]; ok {
+						if keyS, ok := keyVal.(*types.AttributeValueMemberS); ok {
+							vars[keyS.Value] = s.Value
+						}
+					}
 				} else {
-					log.Warning("Skipping key '%s'. 'value' is not of type 'string'.", *item["key"].S)
+					if keyVal, ok := item["key"]; ok {
+						if keyS, ok := keyVal.(*types.AttributeValueMemberS); ok {
+							log.Warning("Skipping key '%s'. 'value' is not of type 'string'.", keyS.Value)
+						}
+					}
 				}
 				continue
 			}

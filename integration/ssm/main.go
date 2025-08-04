@@ -1,14 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
-	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
 var db map[string]string
@@ -22,7 +23,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	case "AmazonSSM.PutParameter":
 		defer r.Body.Close()
 		var b ssm.PutParameterInput
-		err := jsonutil.UnmarshalJSON(&b, r.Body)
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&b)
 		if err != nil {
 			panic(err)
 		}
@@ -33,27 +35,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	case "AmazonSSM.GetParametersByPath":
 		defer r.Body.Close()
 		var b ssm.GetParametersByPathInput
-		err := jsonutil.UnmarshalJSON(&b, r.Body)
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&b)
 		if err != nil {
 			panic(err)
 		}
 		log.Printf("Body=%#v\n", b)
-		var GetParametersByPathOutput ssm.GetParametersByPathOutput
-		parameters := make([]*ssm.Parameter, 0, 0)
+		parameters := make([]types.Parameter, 0, 0)
 		path := b.Path
 		for k, v := range db {
 			if strings.HasPrefix(k, *path+"/") == false {
 				continue
 			}
-			log.Printf("DB: Getting key=%s", k)
-			parameters = append(parameters, &ssm.Parameter{
+			parameters = append(parameters, types.Parameter{
 				Name:  aws.String(k),
-				Type:  aws.String("String"),
+				Type:  types.ParameterTypeString,
 				Value: aws.String(v),
 			})
 		}
-		GetParametersByPathOutput.SetParameters(parameters)
-		resp, err := jsonutil.BuildJSON(GetParametersByPathOutput)
+		var GetParametersByPathOutput ssm.GetParametersByPathOutput
+		GetParametersByPathOutput.Parameters = parameters
+		resp, err := json.Marshal(GetParametersByPathOutput)
 		if err != nil {
 			panic(err)
 		}
@@ -62,20 +64,20 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	case "AmazonSSM.GetParameter":
 		defer r.Body.Close()
 		var b ssm.GetParameterInput
-		err := jsonutil.UnmarshalJSON(&b, r.Body)
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&b)
 		if err != nil {
 			panic(err)
 		}
 		log.Printf("Body=%#v\n", b)
 		var GetParameterOutput ssm.GetParameterOutput
-		log.Printf("DB: Getting key=%s", *b.Name)
-		parameter := &ssm.Parameter{
+		parameter := &types.Parameter{
 			Name:  aws.String(*b.Name),
-			Type:  aws.String("String"),
+			Type:  types.ParameterTypeString,
 			Value: aws.String(db[*b.Name]),
 		}
-		GetParameterOutput.SetParameter(parameter)
-		resp, err := jsonutil.BuildJSON(GetParameterOutput)
+		GetParameterOutput.Parameter = parameter
+		resp, err := json.Marshal(GetParameterOutput)
 		if err != nil {
 			panic(err)
 		}

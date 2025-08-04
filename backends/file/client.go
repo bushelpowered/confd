@@ -8,9 +8,9 @@ import (
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/goccy/go-yaml"
 	"github.com/kelseyhightower/confd/log"
 	util "github.com/kelseyhightower/confd/util"
-	"gopkg.in/yaml.v2"
 )
 
 var replacer = strings.NewReplacer("/", "_")
