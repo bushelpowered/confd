@@ -38,3 +38,9 @@ release:
 	done
 	@docker run -it --rm -v ${PWD}:/app -e "GOOS=linux" -e "GOARCH=arm64" -e "CGO_ENABLED=0" confd_builder go build -ldflags="-s -w -X main.GitSHA=${GIT_SHA}" -o bin/confd-${VERSION}-linux-arm64;
 	@upx bin/confd-${VERSION}-*
+
+update-mods:
+	go get -u ./... && go mod tidy && go mod vendor
+	git add -A .
+	git commit -am "Update modules"
+	git push origin master
